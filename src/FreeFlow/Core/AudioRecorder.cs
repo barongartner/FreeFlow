@@ -240,7 +240,11 @@ public sealed class AudioRecorder : IDisposable
                 catch { }
             }
         }
-        else
+
+        // nothing configured, or the configured mic is gone (unplugged AirPods, new
+        // mic): use the system default and judge Bluetooth from what it really is,
+        // never from a stale configured name
+        if (index == -1)
         {
             // default device — ask CoreAudio what it actually is, for Bluetooth detection
             try

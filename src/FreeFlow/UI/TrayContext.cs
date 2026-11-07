@@ -265,26 +265,35 @@ public sealed class TrayContext : ApplicationContext
         }
     }
 
+    /// <summary>Keep recording this long after the key comes up. People let go while the
+    /// last word is still leaving their mouth, and the driver holds the newest ~40-80ms
+    /// in buffers that haven't been delivered yet; stopping instantly chopped both.</summary>
+    private const int ReleaseTailMs = 220;
+
     private void StopAndProcess()
     {
-        var samples = _recorder.StopCapture();
         bool isCommand = _commandCapture;
         _commandCapture = false;
-        bool wasLive = _liveTyper.Active;
         string livePrefix = _livePrefix;
         _state = FlowState.Processing;
-        SoundFx.RecordStop(_cfg);
         _overlay.SetState(OverlayState.Processing);
         SetTray(TrayIcons.Processing, "FreeFlow: processing");
 
         Task.Run(async () =>
         {
-            // drain the live decoder first — its final text is our fallback
-            string rawStream = _streaming.FinishSession();
+            await Task.Delay(ReleaseTailMs);
+            var samples = _recorder.StopCapture();
+            bool wasLive = _liveTyper.Active;
+            SoundFx.RecordStop(_cfg); // after the tail, so the beep can't bleed into the take
+
+            // drain the live decoder in parallel with the final pass instead of before
+            // it; its text is only the fallback, so nothing should wait on it
+            var streamTask = Task.Run(_streaming.FinishSession);
             double audioSec = samples.Length / 16000.0;
 
             if (audioSec < 0.35)
             {
+                await streamTask;
                 Finish(() =>
                 {
                     if (wasLive) _liveTyper.Erase();
@@ -301,6 +310,7 @@ public sealed class TrayContext : ApplicationContext
             if (rms < 0.0015)
             {
                 Logger.Log($"utterance {audioSec:0.0}s was silence (rms {rms:0.0000}) — likely BT link renegotiating");
+                await streamTask;
                 Finish(() =>
                 {
                     if (wasLive) _liveTyper.Erase();
@@ -312,7 +322,7 @@ public sealed class TrayContext : ApplicationContext
 
             if (isCommand)
             {
-                await RunCommandMode(samples, rawStream);
+                await RunCommandMode(samples, await streamTask);
                 return;
             }
 
@@ -328,13 +338,14 @@ public sealed class TrayContext : ApplicationContext
                 try
                 {
                     if (_engine.IsLoaded)
-                        finalRaw = _engine.Transcribe(samples);
+                        finalRaw = _engine.Transcribe(TrimSilence(samples));
                 }
                 catch (Exception ex)
                 {
                     Logger.Log(ex, "final-pass transcription");
                 }
             }
+            string rawStream = await streamTask;
             if (string.IsNullOrWhiteSpace(finalRaw))
                 finalRaw = _cfg.FinalPass == "off" ? rawStream : _streaming.Punctuate(rawStream);
             sw.Stop();
@@ -626,6 +637,38 @@ public sealed class TrayContext : ApplicationContext
     }
 
     #endregion
+
+    /// <summary>Cut dead air off both ends before the final pass. Parakeet's cost scales
+    /// with audio length, and the second of silence before you start talking (plus the
+    /// release tail) was pure wasted encode time. Generous padding so quiet first and
+    /// last syllables survive.</summary>
+    internal static float[] TrimSilence(float[] s)
+    {
+        const int frame = 320;     // 20ms at 16 kHz
+        const int pad = 16000 * 3 / 10; // 300ms either side
+        int frames = s.Length / frame;
+        if (frames < 10) return s;
+
+        var rms = new double[frames];
+        double peak = 0;
+        for (int f = 0; f < frames; f++)
+        {
+            double sum = 0;
+            for (int i = f * frame; i < (f + 1) * frame; i++) sum += s[i] * s[i];
+            rms[f] = Math.Sqrt(sum / frame);
+            peak = Math.Max(peak, rms[f]);
+        }
+        double threshold = Math.Max(0.004, peak * 0.06);
+
+        int first = Array.FindIndex(rms, r => r > threshold);
+        int last = Array.FindLastIndex(rms, r => r > threshold);
+        if (first < 0) return s;
+
+        int start = Math.Max(0, first * frame - pad);
+        int end = Math.Min(s.Length, (last + 1) * frame + pad);
+        if (end - start >= s.Length - frame) return s;
+        return s[start..end];
+    }
 
     private static string Truncate(string s, int max)
         => s.Length <= max ? s : s[..max] + "…";
